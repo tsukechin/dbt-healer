@@ -21,10 +21,20 @@ class ProviderOutputTests(unittest.TestCase):
         """Check valid solution uses source context path."""
         response = (
             "<solution>\nselect 2 as id\n</solution>\n"
-            "<file>\nmodels/core/customers.sql\n</file>"
+            "<file>\nmodels/core/customers.sql\n</file>\n"
+            "<summary>\nИзменено: выбрана константа id.\nОшибка: модель customers.\nПричина: восстановлен ожидаемый id.\n</summary>"
         )
 
         self.assertTrue(is_valid_solution(response, FILE_CONTEXT))
+
+    def test_real_solution_requires_summary(self):
+        """Check real fixes must include commit summary details."""
+        response = (
+            "<solution>\nselect 2 as id\n</solution>\n"
+            "<file>\nmodels/core/customers.sql\n</file>"
+        )
+
+        self.assertFalse(is_valid_solution(response, FILE_CONTEXT))
 
     def test_solution_with_unknown_path_is_invalid(self):
         """Check solution with unknown path is rejected."""

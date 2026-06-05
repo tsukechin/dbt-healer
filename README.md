@@ -10,6 +10,7 @@ The project is aimed at data teams that have recurring dbt failures in feature b
 - Clones the failed repository commit into a local workspace.
 - Parses dbt logs to detect failing models, snapshots, seeds, or macros.
 - Builds source context from the failing file, git diff, and dbt manifest lineage.
+- Reviews changed dbt business logic and sends Telegram findings when risky changes are detected.
 - Sends the context to an AI provider.
 - Validates that the model returns strict `<solution>` and `<file>` blocks.
 - Creates a GitHub branch and pull request with the suggested fix.
@@ -34,7 +35,7 @@ Core modules:
 - `service/failure_ingest.py` - FastAPI webhook receiver.
 - `app/utils.py` - dbt log parsing, repo clone, and dbt metadata setup.
 - `app/context.py` - source, diff, and lineage context extraction.
-- `app/rag.py` - focused lineage snippets using LangChain, FAISS, and Ollama embeddings.
+- `app/rag.py` - focused lineage snippets using deterministic SQL attributes and relevant windows.
 - `app/providers.py` - Ollama, Google AI Studio, and DeepSeek providers.
 - `app/push_repo.py` - solution parsing and GitHub PR updates.
 - `app/ci_generator.py` - GitHub Actions workflow and dbt `profiles.yml` CI profile generation.

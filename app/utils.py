@@ -15,7 +15,18 @@ from app.dbt_exps import (
 )
 
 config = get_config()
+status_logger = logging.getLogger("uvicorn.error")
 exp = DbtRegularExpressions()
+CI_FETCH_DEPTH = "50"
+
+
+def _status(message: str, run_id: str | None = None) -> None:
+    """Log a user-facing status line for CLI log streaming."""
+    if run_id:
+        status_logger.info("(%s) STATUS: %s", run_id, message)
+    else:
+        status_logger.info("STATUS: %s", message)
+
 
 def get_failed_repo_path() -> Path:
     """Return checked-out dbt project path."""
@@ -118,7 +129,154 @@ def _resolve_manifest_source(resource_name: str | None) -> str | None:
     return None
 
 
-def _resolve_test_failure_source(test_name: str | None, raw_path: str | None) -> str | None:
+def _test_model_dependencies(manifest: dict, test_node: dict | None) -> list[tuple[str, dict]]:
+    """Return dbt model-like dependencies for a test node."""
+    nodes = manifest.get("nodes", {})
+    dependencies = []
+    for dep_id in (test_node or {}).get("depends_on", {}).get("nodes", []):
+        dep_node = nodes.get(dep_id)
+        if dep_node and dep_node.get("resource_type") in ("model", "snapshot", "seed"):
+            dependencies.append((dep_id, dep_node))
+    return dependencies
+
+
+def _is_relationship_test_node(test_node: dict | None) -> bool:
+    """Return whether a manifest test node is a dbt relationships test."""
+    if not test_node:
+        return False
+
+    metadata = test_node.get("test_metadata") or {}
+    if metadata.get("name") == "relationships":
+        return True
+
+    return str(test_node.get("name") or "").startswith("relationships_")
+
+
+def _relationship_error_side(error_log: str | None) -> str | None:
+    """Return the relationships test side that appears to have failed."""
+    text = _clean_log_text(error_log)
+    if re.search(r"\bas\s+from_field\b|\bfrom_field\b", text, flags=re.IGNORECASE):
+        return "from"
+    if re.search(r"\bas\s+to_field\b|\bto_field\b", text, flags=re.IGNORECASE):
+        return "to"
+    return None
+
+
+def _test_attached_model(manifest: dict, test_node: dict | None) -> tuple[str, dict] | None:
+    """Return the model attached to a generic dbt test when available."""
+    attached_id = (test_node or {}).get("attached_node")
+    attached_node = manifest.get("nodes", {}).get(attached_id)
+    if attached_node and attached_node.get("resource_type") in ("model", "snapshot", "seed"):
+        return attached_id, attached_node
+    return None
+
+
+def _ref_name(value: str | None) -> str | None:
+    """Extract a dbt ref name from test metadata text."""
+    match = re.search(
+        r"\bref\s*\(\s*['\"]([^'\"]+)['\"](?:\s*,\s*['\"]([^'\"]+)['\"])?",
+        str(value or ""),
+    )
+    return (match.group(2) or match.group(1)) if match else None
+
+
+def _relationship_test_model_roles(
+    manifest: dict,
+    test_node: dict | None,
+    test_name: str | None = None,
+) -> dict[str, tuple[str, dict]]:
+    """Return source and referenced model roles for a relationships test."""
+    if not _is_relationship_test_node(test_node):
+        return {}
+
+    dependencies = _test_model_dependencies(manifest, test_node)
+    if not dependencies:
+        return {}
+
+    metadata = (test_node or {}).get("test_metadata") or {}
+    kwargs = metadata.get("kwargs") or {}
+    ref_name = _ref_name(kwargs.get("to"))
+    roles: dict[str, tuple[str, dict]] = {}
+
+    for dep_id, dep_node in dependencies:
+        dep_identifiers = {
+            str(dep_node.get("name") or ""),
+            str(dep_node.get("alias") or ""),
+            Path(str(dep_node.get("original_file_path") or "")).stem,
+        }
+        if ref_name and ref_name in dep_identifiers:
+            roles["to"] = (dep_id, dep_node)
+            break
+
+    attached = _test_attached_model(manifest, test_node)
+    if attached:
+        roles["from"] = attached
+
+    names = [
+        str(test_name or ""),
+        str((test_node or {}).get("name") or ""),
+        str((test_node or {}).get("alias") or ""),
+    ]
+    for name in names:
+        clean_name = name.strip().strip("`'\".,;:()[]{}").split(".")[-1]
+        if not clean_name:
+            continue
+        for dep_id, dep_node in sorted(
+            dependencies,
+            key=lambda item: len(str(item[1].get("name") or "")),
+            reverse=True,
+        ):
+            dep_name = str(dep_node.get("name") or Path(str(dep_node.get("original_file_path") or "")).stem)
+            if clean_name.startswith(f"relationships_{dep_name}_"):
+                roles["from"] = (dep_id, dep_node)
+                break
+        if "from" in roles:
+            break
+
+    if len(dependencies) == 2:
+        if "from" in roles and "to" not in roles:
+            roles["to"] = next(dep for dep in dependencies if dep[0] != roles["from"][0])
+        if "to" in roles and "from" not in roles:
+            roles["from"] = next(dep for dep in dependencies if dep[0] != roles["to"][0])
+
+    return roles
+
+
+def _resolve_test_node_source(
+    manifest: dict,
+    test_node: dict,
+    test_name: str,
+    error_log: str | None,
+) -> str | None:
+    """Resolve the most relevant source file for a manifest test node."""
+    if _is_relationship_test_node(test_node):
+        roles = _relationship_test_model_roles(manifest, test_node, test_name)
+        side = _relationship_error_side(error_log) or "from"
+        preferred = roles.get(side) or roles.get("from") or roles.get("to")
+        if preferred:
+            resolved = _normalize_dbt_source_path(preferred[1].get("original_file_path"))
+            if resolved:
+                return resolved
+
+    attached = _test_attached_model(manifest, test_node)
+    if attached:
+        resolved = _normalize_dbt_source_path(attached[1].get("original_file_path"))
+        if resolved:
+            return resolved
+
+    for _, dep_node in _test_model_dependencies(manifest, test_node):
+        resolved = _normalize_dbt_source_path(dep_node.get("original_file_path"))
+        if resolved:
+            return resolved
+
+    return None
+
+
+def _resolve_test_failure_source(
+    test_name: str | None,
+    raw_path: str | None,
+    error_log: str | None = None,
+) -> str | None:
     """Resolve tested source file for dbt test failure."""
     if not test_name:
         return None
@@ -135,12 +293,9 @@ def _resolve_test_failure_source(test_name: str | None, raw_path: str | None) ->
             and not node_id.endswith(f".{name}")
         ):
             continue
-        for dep_id in node.get("depends_on", {}).get("nodes", []):
-            dep_node = manifest.get("nodes", {}).get(dep_id)
-            if dep_node and dep_node.get("resource_type") in ("model", "snapshot", "seed"):
-                resolved = _normalize_dbt_source_path(dep_node.get("original_file_path"))
-                if resolved:
-                    return resolved
+        resolved = _resolve_test_node_source(manifest, node, name, error_log)
+        if resolved:
+            return resolved
 
     try:
         failed_repo_path = get_failed_repo_path()
@@ -195,10 +350,11 @@ def _resolve_dbt_error_reference(
     resource_type: str | None,
     resource_name: str | None,
     raw_path: str | None,
+    error_log: str | None = None,
 ) -> str | None:
     """Resolve dbt error reference to source file path."""
     if resource_type and resource_type.lower() == "test":
-        return _resolve_test_failure_source(resource_name, raw_path)
+        return _resolve_test_failure_source(resource_name, raw_path, error_log)
 
     return _normalize_dbt_source_path(raw_path) or _resolve_source_file(resource_name)
 
@@ -218,6 +374,7 @@ def get_error_files_from_dbt_log(log_text: str | list[str] | None) -> list[str]:
                 resource,
                 match.groupdict().get("name"),
                 match.groupdict().get("path"),
+                text,
             )
             if resolved:
                 files.append(resolved)
@@ -248,46 +405,17 @@ def get_error_files_from_dbt_log(log_text: str | list[str] | None) -> list[str]:
 
     return _dedupe(files)
 
-def scan_hashes() -> None:
-    """Scan dbt log for error hashes and store them in a separate file."""
-    with config.logs_file.open('r', encoding='utf-8') as err_:
-        err_lines = err_.read().splitlines(True)
-
-    if not config.uploaded_dbt_log.exists():
-        return
-
-    with config.logs_file.open('a', encoding='utf-8') as err:
-        with config.uploaded_dbt_log.open('r', encoding='utf-8') as f:
-            for line in f:
-                if '=' * 30 in line and '|' in line:
-                    h = line.split('|')[1].replace('=', '').strip() + '\n'
-                    if h not in err_lines:
-                        err.write(h)
-
 def get_context_log() -> str:
-    """Retrieve the context log based on the last stored error hash."""
-    with config.logs_file.open('r', encoding='utf-8') as err:
-        lines = err.read().splitlines(True)
+    """Return the uploaded CI dbt log or the local dbt log."""
+    for path in (config.uploaded_dbt_log, config.dbt_log):
+        if not path.exists():
+            continue
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            logging.warning("Unable to read dbt log at %s: %s", path, exc)
 
-    if not lines:
-        return []
-
-    last_hash = lines[-1].strip()
-
-    if not config.uploaded_dbt_log.exists():
-        return []
-
-    is_found = False
-    context_log = []
-    
-    with config.uploaded_dbt_log.open('r', encoding='utf-8') as f:
-        for line in f:
-            if last_hash in line:
-                is_found = True
-            if is_found and line.strip():
-                context_log.append(line.strip())
-    
-    return '\n'.join(context_log)
+    return ""
 
 
 def get_instruction(name: str) -> str:
@@ -306,7 +434,7 @@ def has_dbt_dependencies(dbt_project_path: Path) -> bool:
     return any((dbt_project_path / name).exists() for name in ("packages.yml", "dependencies.yml"))
 
 
-def prepare_dbt_metadata(dbt_project_path: Path) -> None:
+def prepare_dbt_metadata(dbt_project_path: Path, run_id: str | None = None) -> None:
     """Refresh dbt dependencies and manifest metadata."""
     if has_dbt_dependencies(dbt_project_path):
         try:
@@ -320,8 +448,11 @@ def prepare_dbt_metadata(dbt_project_path: Path) -> None:
         logging.info("No dbt package config found; skipping dbt deps.")
 
     try:
+        _status("Running dbt parse", run_id)
         subprocess.run(["dbt", "--show-all-deprecations", "parse"], cwd=dbt_project_path, check=True)
+        _status("dbt parse completed", run_id)
     except subprocess.CalledProcessError as e:
+        _status("dbt parse failed", run_id)
         logging.warning(
             f"dbt parse failed; continuing without manifest lineage context. Error: {e}"
         )
@@ -338,31 +469,81 @@ def _authenticated_repo_url(repo: str) -> str:
     return repo.replace("https://", f"https://{config.github_name}:{token}@")
 
 
-def clone_repo_from_ci(repo: str, commit_hash: str, dbt_path: str, log_file: BinaryIO) -> None:
-    """Clone failed repository and store uploaded dbt log."""
+def _ci_repo_root(repo: str, run_id: str | None = None) -> Path:
+    """Return CI workspace root for a repository and optional run id."""
     workdir = Path(Path.home() / ".failedrepo")
     workdir.mkdir(parents=True, exist_ok=True)
-
     repo_name = repo.split("/")[-1].replace(".git", "")
     repo_dir = workdir / repo_name
+    if run_id:
+        repo_dir = repo_dir / run_id
+    return repo_dir
 
+
+def _is_empty_commit(commit_hash: str | None) -> bool:
+    """Return whether CI provided an empty all-zero commit placeholder."""
+    return not commit_hash or set(commit_hash.strip()) == {"0"}
+
+
+def clone_repo_from_ci(
+    repo: str,
+    commit_hash: str,
+    dbt_path: str,
+    log_file: BinaryIO | None = None,
+    run_id: str | None = None,
+    branch_name: str | None = None,
+    diff_base: str | None = None,
+) -> None:
+    """Clone CI repository workspace and optionally store uploaded dbt log."""
+    repo_dir = _ci_repo_root(repo, run_id)
     auth_repo = _authenticated_repo_url(repo)
 
     if not (repo_dir / ".git").exists():
-        subprocess.run(["git", "clone", "--depth", "1", auth_repo], cwd=workdir, check=True)
-    
-    subprocess.run(["git", "fetch", "origin"], cwd=repo_dir, check=True)
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "--depth", CI_FETCH_DEPTH, auth_repo, str(repo_dir)], check=True)
+
+    if branch_name:
+        subprocess.run(
+            [
+                "git",
+                "fetch",
+                "origin",
+                f"refs/heads/{branch_name}:refs/remotes/origin/{branch_name}",
+                "--depth",
+                CI_FETCH_DEPTH,
+            ],
+            cwd=repo_dir,
+            check=True,
+        )
+    else:
+        subprocess.run(["git", "fetch", "origin", commit_hash, "--depth", CI_FETCH_DEPTH], cwd=repo_dir, check=False)
+
+    if not _is_empty_commit(diff_base):
+        subprocess.run(["git", "fetch", "origin", diff_base, "--depth", CI_FETCH_DEPTH], cwd=repo_dir, check=False)
+        (repo_dir / ".healer_diff_base").write_text(diff_base.strip(), encoding="utf-8")
+
+    subprocess.run(
+        [
+            "git",
+            "fetch",
+            "origin",
+            f"{config.base_branch}:refs/remotes/origin/{config.base_branch}",
+            "--depth",
+            CI_FETCH_DEPTH,
+        ],
+        cwd=repo_dir,
+        check=False,
+    )
     subprocess.run(["git", "checkout", commit_hash], cwd=repo_dir, check=True)
 
-    config.logs_file.parent.mkdir(parents=True, exist_ok=True)
-    config.logs_file.touch(exist_ok=True)
-    config.uploaded_dbt_log.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(config.uploaded_dbt_log, "wb") as f:
-        f.write(log_file.file.read())
+    if log_file is not None:
+        logs_dir = repo_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        with open(logs_dir / "payload_dbt.log", "wb") as f:
+            f.write(log_file.file.read())
 
     failed_repo_path = repo_dir / dbt_path
     if not failed_repo_path.exists():
         raise RuntimeError(f"DBT project not found at {failed_repo_path}")
 
-    prepare_dbt_metadata(failed_repo_path)
+    prepare_dbt_metadata(failed_repo_path, run_id)

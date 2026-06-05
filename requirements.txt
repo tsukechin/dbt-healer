@@ -16,7 +16,6 @@ colorama==0.4.6
 cryptography==46.0.5
 distro==1.9.0
 fastapi==0.133.0
-faiss-cpu==1.13.2
 frozenlist==1.8.0
 google-auth==2.48.0
 google-genai==1.64.0
@@ -24,11 +23,6 @@ h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 idna==3.11
-langchain==1.2.15
-langchain-classic==1.0.3
-langchain-community==0.4
-langchain-core==1.2.29
-langchain-ollama==1.1.0
 magic-filter==1.0.12
 markdown-it-py==4.0.0
 mdurl==0.1.2

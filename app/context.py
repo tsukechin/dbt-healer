@@ -14,10 +14,10 @@ from app.rag import (
 )
 
 MODEL_TYPES = {"model", "snapshot", "seed"}
-MAX_DIAGNOSTIC_MODELS = 6
-MAX_IMPACT_MODELS = 5
-MAX_UPSTREAM_DEPTH = 2
-MAX_DOWNSTREAM_DEPTH = 2
+MAX_DIAGNOSTIC_MODELS = 1
+MAX_IMPACT_MODELS = 1
+MAX_UPSTREAM_DEPTH = 1
+MAX_DOWNSTREAM_DEPTH = 1
 COMPILED_SQL_RE = re.compile(r"compiled code at\s+(?P<path>target/[^\s]+\.sql)", re.IGNORECASE)
 ERROR_LOCATION_RE = re.compile(r"\b(?:line|LINE)\s+\d+|\[\d+:\d+\]")
 COLUMN_ERROR_RE = re.compile(
@@ -103,14 +103,8 @@ def _needs_lineage_context(error_log: str) -> bool:
     return bool(_test_failure_name(error_log) or COLUMN_ERROR_RE.search(error_log))
 
 
-def _should_shrink_context() -> bool:
-    return str(getattr(utils.config, "ai_provider", "") or "").lower() == "ollama"
-
-
-def _context_text(source: str, signals: set[str], query: str) -> str:
-    if not _should_shrink_context():
-        return source
-    return structured_sql_context(source, signals, query=query)
+def _context_text(source: str, signals: set[str]) -> str:
+    return structured_sql_context(source, signals)
 
 
 def _read_manifest(failed_repo_path: Path) -> dict:
@@ -254,23 +248,95 @@ def _test_failure_context(manifest: dict, test_node: dict | None) -> str:
     return "<DBT_TEST_FAILURE>\n" + "\n".join(lines) + "\n</DBT_TEST_FAILURE>"
 
 
+def _relationship_side_label(side: str | None) -> str:
+    """Return dbt relationships compiled-column label for a side."""
+    if side == "from":
+        return "from_field"
+    if side == "to":
+        return "to_field"
+    return "unknown"
+
+
+def _relationship_error_hints(error_log: str) -> list[str]:
+    """Extract compact dbt error hints useful for relationships tests."""
+    hints = []
+    missing = list(
+        dict.fromkeys(
+            match.group(1)
+            for match in re.finditer(
+                r"\b(?:column|field|identifier)\s+\"([^\"]+)\"",
+                error_log,
+                flags=re.IGNORECASE,
+            )
+        )
+    )
+    if missing:
+        hints.append(f"missing_identifier: {', '.join(missing)}")
+
+    hint_match = re.search(r"\bHINT:\s*(.+)", error_log)
+    if hint_match:
+        hints.append(f"db_hint: {hint_match.group(1).strip()}")
+
+    return hints
+
+
+def _relationship_test_context(manifest: dict, test_node: dict | None, error_log: str) -> str:
+    """Build narrow source/target context for dbt relationships tests."""
+    if not utils._is_relationship_test_node(test_node):
+        return ""
+
+    roles = utils._relationship_test_model_roles(manifest, test_node, _test_failure_name(error_log))
+    metadata = (test_node or {}).get("test_metadata") or {}
+    kwargs = metadata.get("kwargs") or {}
+    from_column = (test_node or {}).get("column_name") or kwargs.get("column_name")
+    to_column = kwargs.get("field")
+    side = utils._relationship_error_side(error_log)
+
+    lines = [
+        f"name: {(test_node or {}).get('name')}",
+        "type: relationships",
+        f"error_side: {_relationship_side_label(side)}",
+    ]
+
+    from_role = roles.get("from")
+    if from_role:
+        from_node = from_role[1]
+        lines.append(f"from_model: {from_node.get('name')} ({from_node.get('original_file_path')})")
+    if from_column:
+        lines.append(f"from_column: {from_column}")
+
+    to_role = roles.get("to")
+    if to_role:
+        to_node = to_role[1]
+        lines.append(f"to_model: {to_node.get('name')} ({to_node.get('original_file_path')})")
+    if to_column:
+        lines.append(f"to_column: {to_column}")
+
+    lines.extend(_relationship_error_hints(error_log))
+    lines.append(
+        "resolution_rule: from_field means fix from_model/from_column; "
+        "to_field means fix to_model/to_column."
+    )
+
+    return "<RELATIONSHIP_TEST_CONTEXT>\n" + "\n".join(lines) + "\n</RELATIONSHIP_TEST_CONTEXT>"
+
+
 def _lineage_model_ids(
     failed_repo_path: Path,
     manifest: dict,
     root_id: str,
     signals: set[str],
-    query: str,
     next_ids,
     max_depth: int,
     max_models: int,
     relevance_after_first: bool = False,
-) -> list[tuple[str, int, set[str], str]]:
+) -> list[tuple[str, int, set[str]]]:
     selected = []
     seen = {root_id}
-    queue = [(root_id, 0, signals, query)]
+    queue = [(root_id, 0, signals)]
 
     while queue and len(selected) < max_models:
-        parent_id, depth, parent_signals, parent_query = queue.pop(0)
+        parent_id, depth, parent_signals = queue.pop(0)
         if depth >= max_depth:
             continue
 
@@ -295,13 +361,12 @@ def _lineage_model_ids(
                     continue
 
             seen.add(node_id)
-            selected.append((node_id, depth + 1, parent_signals, parent_query))
+            selected.append((node_id, depth + 1, parent_signals))
             queue.append(
                 (
                     node_id,
                     depth + 1,
                     _model_signals(failed_repo_path, manifest, node_id),
-                    _model_source(failed_repo_path, node),
                 )
             )
             if len(selected) >= max_models:
@@ -317,11 +382,10 @@ def _node_context(
     signals: set[str],
     label: str,
     depth: int,
-    query: str = "",
 ) -> str:
     node = manifest["nodes"][node_id]
     source = _model_source(failed_repo_path, node)
-    body = _context_text(source, signals, query)
+    body = _context_text(source, signals)
     return (
         f"<{label} name=\"{node['name']}\" path=\"{node['original_file_path']}\" depth=\"{depth}\">\n"
         f"{body}\n"
@@ -335,7 +399,6 @@ def _related_test_contexts(
     test_node: dict | None,
     primary_id: str,
     signals: set[str],
-    query: str,
 ) -> dict[str, str]:
     contexts = {}
     for index, model_id in enumerate(_test_model_ids(manifest, test_node), start=1):
@@ -349,17 +412,14 @@ def _related_test_contexts(
             signals,
             "RELATED_TEST_MODEL",
             1,
-            query,
         )
     return contexts
 
 
-def _definition_text(path: Path, signals: set[str], query: str) -> str:
+def _definition_text(path: Path, signals: set[str]) -> str:
     text = _read_source_text(path)
     if path.suffix.lower() not in {".yml", ".yaml"}:
-        return _context_text(text, signals, query)
-    if not _should_shrink_context():
-        return text
+        return _context_text(text, signals)
 
     lines = [
         line.rstrip()
@@ -370,7 +430,7 @@ def _definition_text(path: Path, signals: set[str], query: str) -> str:
     return compact[:1600].strip()
 
 
-def _macro_contexts(failed_repo_path: Path, manifest: dict, node: dict, source: str, query: str) -> list[str]:
+def _macro_contexts(failed_repo_path: Path, manifest: dict, node: dict, source: str) -> list[str]:
     macro_ids = list(node.get("depends_on", {}).get("macros", []))
     macro_names = extract_macro_calls(source)
 
@@ -384,7 +444,7 @@ def _macro_contexts(failed_repo_path: Path, manifest: dict, node: dict, source: 
         path = macro.get("original_file_path") if macro else None
         if not path:
             continue
-        text = _context_text(_read_source_text(failed_repo_path / path), macro_names, query)
+        text = _context_text(_read_source_text(failed_repo_path / path), macro_names)
         contexts.append(f"<MACRO_CONTEXT name=\"{macro.get('name')}\" path=\"{path}\">\n{text}\n</MACRO_CONTEXT>")
     return contexts
 
@@ -402,7 +462,7 @@ def _definition_contexts(
         source = manifest.get("sources", {}).get(source_id)
         path = source.get("original_file_path") if source else None
         if path:
-            text = _definition_text(failed_repo_path / path, signals, error_log)
+            text = _definition_text(failed_repo_path / path, signals)
             contexts.append(
                 f"<SOURCE_DEFINITION name=\"{source.get('name')}\" path=\"{path}\">\n"
                 f"{text}\n"
@@ -412,7 +472,7 @@ def _definition_contexts(
     for match in utils.exp.DBT_SOURCE_PATH_RE.finditer(error_log):
         path = utils._normalize_dbt_source_path(match.group("path"))
         if path and path.endswith((".yml", ".yaml")) and path != node.get("original_file_path"):
-            text = _definition_text(failed_repo_path / path, signals, error_log)
+            text = _definition_text(failed_repo_path / path, signals)
             if text:
                 contexts.append(
                     f"<SCHEMA_DEFINITION path=\"{path}\">\n"
@@ -435,8 +495,7 @@ def _compiled_sql_context(failed_repo_path: Path, error_log: str) -> str:
 
     location = ERROR_LOCATION_RE.search(error_log)
     location_text = f' location="{location.group(0)}"' if location else ""
-    if _should_shrink_context():
-        text = text[:3000]
+    text = text[:3000]
     return f"<COMPILED_SQL path=\"{path}\"{location_text}>\n{text}\n</COMPILED_SQL>"
 
 
@@ -460,10 +519,15 @@ def parse_lineage_models(model: str) -> dict[str, str]:
     primary_source = _model_source(failed_repo_path, node)
     signals = extract_error_signals(error_log, primary_source) | _test_signals(manifest, test_node)
     contexts = {}
+    is_relationship_test = utils._is_relationship_test_node(test_node)
 
     test_context = _test_failure_context(manifest, test_node)
     if test_context:
         contexts["test_failure"] = test_context
+
+    relationship_context = _relationship_test_context(manifest, test_node, error_log)
+    if relationship_context:
+        contexts["relationship_test"] = relationship_context
 
     contexts.update(
         _related_test_contexts(
@@ -472,34 +536,32 @@ def parse_lineage_models(model: str) -> dict[str, str]:
             test_node,
             node_id,
             signals,
-            error_log,
         )
     )
 
-    for upstream_id, depth, context_signals, context_query in _lineage_model_ids(
-        failed_repo_path,
-        manifest,
-        node_id,
-        signals,
-        error_log,
-        _upstream_model_ids,
-        MAX_UPSTREAM_DEPTH,
-        MAX_DIAGNOSTIC_MODELS,
-        relevance_after_first=True,
-    ):
-        upstream = manifest["nodes"][upstream_id]
-        contexts[upstream["name"]] = _node_context(
+    if not is_relationship_test:
+        for upstream_id, depth, context_signals in _lineage_model_ids(
             failed_repo_path,
             manifest,
-            upstream_id,
-            context_signals,
-            "UPSTREAM_MODEL",
-            depth,
-            context_query,
-        )
+            node_id,
+            signals,
+            _upstream_model_ids,
+            MAX_UPSTREAM_DEPTH,
+            MAX_DIAGNOSTIC_MODELS,
+            relevance_after_first=True,
+        ):
+            upstream = manifest["nodes"][upstream_id]
+            contexts[upstream["name"]] = _node_context(
+                failed_repo_path,
+                manifest,
+                upstream_id,
+                context_signals,
+                "UPSTREAM_MODEL",
+                depth,
+            )
 
     for index, macro_context in enumerate(
-        _macro_contexts(failed_repo_path, manifest, node, primary_source, error_log),
+        _macro_contexts(failed_repo_path, manifest, node, primary_source),
         start=1,
     ):
         contexts[f"macro_{index}"] = macro_context
@@ -527,6 +589,9 @@ def get_impact_context(file: str) -> str:
 
     primary_source = _model_source(failed_repo_path, node)
     _, test_node = _find_test_node(manifest, error_log)
+    if utils._is_relationship_test_node(test_node):
+        return ""
+
     signals = extract_error_signals(error_log, primary_source) | _test_signals(manifest, test_node)
     sections = [
         _node_context(
@@ -536,14 +601,12 @@ def get_impact_context(file: str) -> str:
             context_signals,
             "DOWNSTREAM_MODEL",
             depth,
-            context_query,
         )
-        for downstream_id, depth, context_signals, context_query in _lineage_model_ids(
+        for downstream_id, depth, context_signals in _lineage_model_ids(
             failed_repo_path,
             manifest,
             node_id,
             signals,
-            error_log,
             _downstream_model_ids,
             MAX_DOWNSTREAM_DEPTH,
             MAX_IMPACT_MODELS,
@@ -567,6 +630,17 @@ def _primary_context_file(file: str, error_log: str) -> str:
     failed_repo_path = utils.get_failed_repo_path()
     manifest = _read_manifest(failed_repo_path)
     _, test_node = _find_test_node(manifest, error_log)
+    if utils._is_relationship_test_node(test_node):
+        roles = utils._relationship_test_model_roles(manifest, test_node, _test_failure_name(error_log))
+        side = utils._relationship_error_side(error_log) or "from"
+        preferred = roles.get(side) or roles.get("from") or roles.get("to")
+        if preferred:
+            return preferred[1]["original_file_path"]
+
+    attached = utils._test_attached_model(manifest, test_node)
+    if attached:
+        return attached[1]["original_file_path"]
+
     for model_id in _test_model_ids(manifest, test_node):
         return manifest["nodes"][model_id]["original_file_path"]
     return file

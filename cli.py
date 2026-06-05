@@ -18,6 +18,21 @@ config = get_config()
 app = typer.Typer(help="DBT Healer CLI")
 
 
+def _yes_no(value: bool) -> str:
+    """Return setup choice label for a boolean value."""
+    return "Yes" if value else "No"
+
+
+def _ask_enabled(question: str, current: bool = True) -> bool:
+    """Ask a yes/no setup question and return boolean answer."""
+    answer = questionary.select(
+        question,
+        choices=["Yes", "No"],
+        default=_yes_no(current),
+    ).ask()
+    return answer == "Yes"
+
+
 @app.command(help="Setup your enviroment for dbt-healer")
 def setup():
     """Run interactive dbt-healer setup."""
@@ -49,6 +64,7 @@ def setup():
                 "Telegram Bot Token",
                 "AI Provider and Token",
                 "Git platform and git parameters",
+                "CI behavior",
             ],
         ).ask()
     else:
@@ -130,6 +146,17 @@ def setup():
         console.print(Markdown(f"12. Enter your full local path of your {answer} repository:"))
         config_dict["full_path_to_repo_str"] = input(">>> ")
 
+    if change_parameter == 'CI behavior' or first_setup:
+        console.print(Markdown("13. Configure dbt-healer CI behavior:"))
+        config_dict["healer_review_enabled"] = _ask_enabled(
+            "Run review before dbt build?",
+            config.healer_review_enabled,
+        )
+        config_dict["healer_analyze_on_failure_enabled"] = _ask_enabled(
+            "Analyze failed dbt builds and create PR/MR?",
+            config.healer_analyze_on_failure_enabled,
+        )
+
     console.print(Markdown("Saving configuration..."))
     time.sleep(1)
 
@@ -140,18 +167,21 @@ def setup():
         )
         time.sleep(1)
 
-    if change_parameter == 'Git platform and git parameters' or first_setup:
+    if change_parameter in {'Git platform and git parameters', 'CI behavior'} or first_setup:
+        platform = config_dict.get("git_platform") or config.git_platform
         generator = {
             "Github": GithubCIGenerator,
             "GitLab": GitlabCIGenerator,
-        }[answer]()
+        }[platform]()
 
         try:
             with console.status("Creating CI workflow..."):
-                ci_file_status = generator.create_ci_file()
+                ci_file_status = generator.create_ci_file(force=change_parameter == 'CI behavior')
 
-            with console.status("Creating CI profile..."):
-                ci_profile_status = generator.create_ci_profile()
+            ci_profile_status = "skipped"
+            if change_parameter != 'CI behavior':
+                with console.status("Creating CI profile..."):
+                    ci_profile_status = generator.create_ci_profile()
 
         except DBTProfilesExistsError as exc:
             console.print(f"[red]{exc}[/red]")
@@ -169,7 +199,10 @@ def setup():
 
 
 @app.command(help="Serve dbt-healer analyzer")
-def serve(port: int = 8888):
+def serve(
+    port: int = 8888,
+    logs: bool = typer.Option(False, "--logs", help="Stream Docker Compose logs after startup."),
+):
     """Start analyzer services with Docker Compose."""
     console.print(Markdown(f"Starting **dbt-healer** server on port {port}..."))
     config = get_config()
@@ -178,6 +211,12 @@ def serve(port: int = 8888):
     subprocess.run(["docker", "compose", "up", "-d"], check=True)
 
     console.print("[green]Server is running![/green]")
+    if logs:
+        console.print("[cyan]Streaming logs. Press Ctrl+C to stop.[/cyan]")
+        try:
+            subprocess.run(["docker", "compose", "logs", "-f"], check=False)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Log streaming stopped.[/yellow]")
 
 
 if __name__ == "__main__":

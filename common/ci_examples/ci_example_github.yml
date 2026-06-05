@@ -43,6 +43,9 @@ jobs:
           cd {dbt_project_name}
           dbt deps
 
+{healer_create_step}
+{healer_review_step}
+
       - name: Build dbt project
         shell: bash
         run: |
@@ -83,12 +86,4 @@ jobs:
             dbt build --profile ci --target ci
           fi
 
-      - name: Push failure to healer
-        if: ${{ failure() && startsWith(github.ref, 'refs/heads/feature/') }}
-        run: |
-          curl -X 'POST' \
-          '{service_endpoint}' \
-          -F "repo={github_link}" \
-          -F "commit_hash=${{ steps.get-hash.outputs.commit_hash }}" \
-          -F "dbt_path={dbt_project_name}" \
-          -F "log_file=@{dbt_project_name}/logs/dbt.log"
+{healer_analyze_failure_step}

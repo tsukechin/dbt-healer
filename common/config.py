@@ -51,6 +51,9 @@ class Config(BaseSettings):
     ollama_host: str = Field(default="", validation_alias="OLLAMA_HOST")
     ollama_num_ctx: int = Field(default=8192, validation_alias="OLLAMA_NUM_CTX")
     ai_max_input_chars: int = Field(default=24000, validation_alias="AI_MAX_INPUT_CHARS")
+    healer_run_id: str = Field(default="", validation_alias="HEALER_RUN_ID")
+    healer_review_enabled: bool = Field(default=True, validation_alias="HEALER_REVIEW_ENABLED")
+    healer_analyze_on_failure_enabled: bool = Field(default=True, validation_alias="HEALER_ANALYZE_ON_FAILURE_ENABLED")
     github_token: str = ""
     telegram_bot_token: str = Field(default="", validation_alias="TELEGRAM_BOT_TOKEN")
     dbt_project_name: str = ""
@@ -66,8 +69,6 @@ class Config(BaseSettings):
     notifier_db_username: str = Field(default="postgres", validation_alias="NOTIFIER_DB_USERNAME")
     notifier_db_password: str = Field(default="postgres", validation_alias="NOTIFIER_DB_PASSWORD")
     notifier_db_port: int = Field(default=5432, validation_alias="NOTIFIER_DB_PORT")
-
-    failed_repo_path: Path | None = None
 
     @field_validator("github_repo_link")
     @classmethod
@@ -107,12 +108,10 @@ class Config(BaseSettings):
     @property
     def repo_root(self) -> Path:
         """Return local path for cloned failed repository."""
-        return Path.home() / ".failedrepo" / (self.github_repo or "")
-
-    @property
-    def logs_file(self) -> Path:
-        """Return path to stored error hashes."""
-        return self.repo_root / "logs" / "err_hashes.txt"
+        root = Path.home() / ".failedrepo" / (self.github_repo or "")
+        if self.healer_run_id:
+            return root / self.healer_run_id
+        return root
 
     @property
     def dbt_log(self) -> Path:
@@ -167,11 +166,6 @@ class Config(BaseSettings):
         """Return configured local repository path."""
         return Path(self.full_path_to_repo_str)
 
-    @property
-    def path_to_dbt_proj(self) -> Path:
-        """Return configured local dbt project path."""
-        return self.full_path_to_repo / self.dbt_project_name
-
     def save(self, config_dict: dict[str, str | None]) -> bool:
         """Persist configuration values to .env file."""
         try:
@@ -192,6 +186,16 @@ class Config(BaseSettings):
             set_key(dotenv_path, "OLLAMA_HOST", str(data.get("ollama_host", self.ollama_host) or ""))
             set_key(dotenv_path, "OLLAMA_NUM_CTX", str(data.get("ollama_num_ctx", self.ollama_num_ctx)))
             set_key(dotenv_path, "AI_MAX_INPUT_CHARS", str(data.get("ai_max_input_chars", self.ai_max_input_chars)))
+            set_key(
+                dotenv_path,
+                "HEALER_REVIEW_ENABLED",
+                str(data.get("healer_review_enabled", self.healer_review_enabled)).lower(),
+            )
+            set_key(
+                dotenv_path,
+                "HEALER_ANALYZE_ON_FAILURE_ENABLED",
+                str(data.get("healer_analyze_on_failure_enabled", self.healer_analyze_on_failure_enabled)).lower(),
+            )
 
             set_key(dotenv_path, "GITHUB_REPO_LINK", str(data.get("github_repo_link", self.github_repo_link) or ""))
             set_key(dotenv_path, "GITHUB_TOKEN", str(data.get("github_token", self.github_token) or ""))
@@ -238,6 +242,8 @@ class Config(BaseSettings):
             f"OLLAMA_HOST: {self.ollama_host or None}\n"
             f"OLLAMA_NUM_CTX: {self.ollama_num_ctx}\n"
             f"AI_MAX_INPUT_CHARS: {self.ai_max_input_chars}\n"
+            f"HEALER_REVIEW_ENABLED: {self.healer_review_enabled}\n"
+            f"HEALER_ANALYZE_ON_FAILURE_ENABLED: {self.healer_analyze_on_failure_enabled}\n"
             f"GITHUB_TOKEN: {'***' if self.github_token else None}\n"
             f"TELEGRAM_BOT_TOKEN: {'***' if self.telegram_bot_token else None}\n"
             f"DBT_PROJECT_NAME: {self.dbt_project_name}\n"

@@ -21,7 +21,10 @@ TRANSIENT_PROVIDER_ERRORS = (
 )
 
 SOURCE_PATH_RE = re.compile(r"(?m)^SOURCE OF\s+([^:\n]+):")
-SOLUTION_BLOCK_RE = re.compile(r"<solution>(.*?)</solution>\s*<file>(.*?)</file>", re.DOTALL)
+SOLUTION_BLOCK_RE = re.compile(
+    r"<solution>(.*?)</solution>\s*<file>(.*?)</file>(?:\s*<summary>(.*?)</summary>)?",
+    re.DOTALL,
+)
 
 
 def retry_request(call, attempts: int = 3):
@@ -66,6 +69,11 @@ def build_solution_prompt(context: str | list[str] | None, file_context: str) ->
     )
 
 
+def build_review_prompt(review_context: str) -> str:
+    """Build prompt payload for change review."""
+    return f"<REVIEW_CONTEXT>\n{review_context or ''}\n</REVIEW_CONTEXT>"
+
+
 def no_fix_solution(file_context: str) -> str:
     """Build fallback solution block without code changes."""
     paths = source_paths(file_context)
@@ -81,6 +89,7 @@ def repair_prompt(file_context: str, bad_response: str) -> str:
 Return only one valid block for this exact file path: {file}
 
 If the previous response contains full corrected file content, put that content in <solution>.
+For a real fix, include <summary> after <file> with Russian Изменено, Ошибка, and Причина lines.
 Otherwise return NO_FIX.
 
 Valid fallback:
@@ -107,10 +116,12 @@ def is_valid_solution(text: str, file_context: str) -> bool:
     if leftover.strip():
         return False
 
-    for solution, file in blocks:
+    for solution, file, summary in blocks:
         solution = solution.strip()
         file = file.strip()
         if not solution or file not in allowed_paths:
+            return False
+        if solution != "NO_FIX" and not (summary or "").strip():
             return False
         if solution.startswith("```") or solution.startswith("diff --git"):
             return False
@@ -164,6 +175,10 @@ class AbstractProvider(ABC):
     def get_models_list(self) -> list[str]:
         """Provides list of models of current provider"""
         ...
+
+    def review_changes(self, review_context: str) -> str:
+        """Review changed code and return strict review output."""
+        raise NotImplementedError
 
     def get_solution(self) -> str:
         """Gets the final response that contains presumably solution"""
@@ -228,6 +243,13 @@ class GoogleAIProvider(AbstractProvider):
             ),
         )
 
+    def review_changes(self, review_context: str) -> str:
+        """Review changed code with Google AI."""
+        return self._generate(
+            get_instruction("handle_review"),
+            build_review_prompt(review_context),
+        )
+
     def get_models_list(self):
         """Return available Google AI model names."""
         return [model.name for model in self.client.models.list() if model.name]
@@ -265,6 +287,19 @@ class BaseChatProvider(AbstractProvider):
             },
         ]
 
+    def _review_messages(self, review_context: str) -> list[dict[str, str]]:
+        """Build messages for change review."""
+        return [
+            {
+                "role": "system",
+                "content": get_instruction("handle_review"),
+            },
+            {
+                "role": "user",
+                "content": build_review_prompt(review_context),
+            },
+        ]
+
     def send_for_llm(self, file_context: str) -> str:
         """Send source context to chat provider and normalize solution."""
         response = retry_request(lambda: self._chat(self._solution_messages(file_context)))
@@ -275,6 +310,10 @@ class BaseChatProvider(AbstractProvider):
                 lambda: self._chat(self._repair_messages(file_context, bad_response))
             ),
         )
+
+    def review_changes(self, review_context: str) -> str:
+        """Review changed code with chat provider."""
+        return retry_request(lambda: self._chat(self._review_messages(review_context)))
 
 
 class DeepSeekProvider(BaseChatProvider):

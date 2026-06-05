@@ -47,6 +47,7 @@ class DbtContextTests(unittest.TestCase):
                 "select {{ generate_surrogate_key(['s.campaign_code']) }} as campaign_id\n"
                 "from {{ ref('stg_campaigns') }} as s"
             ),
+            "models/mart/mart_invoice_rollup.sql": "select campaign_id from {{ ref('core_invoices') }}",
             "models/core/_core_layer_doc.yml": (
                 "models:\n"
                 "  - name: core_invoices\n"
@@ -115,6 +116,12 @@ class DbtContextTests(unittest.TestCase):
                             "original_file_path": "models/core/core_campaign.sql",
                             "depends_on": {"nodes": []},
                         },
+                        "model.shops_dwh.mart_invoice_rollup": {
+                            "resource_type": "model",
+                            "name": "mart_invoice_rollup",
+                            "original_file_path": "models/mart/mart_invoice_rollup.sql",
+                            "depends_on": {"nodes": ["model.shops_dwh.core_invoices"]},
+                        },
                         "test.shops_dwh.relationships_core_invoices_campaign_id__campaign_id__ref_core_campaign_.abc": {
                             "resource_type": "test",
                             "name": "relationships_core_invoices_campaign_id__campaign_id__ref_core_campaign_",
@@ -142,8 +149,9 @@ class DbtContextTests(unittest.TestCase):
                         "model.shops_dwh.raw_customers": ["model.shops_dwh.stg_customers"],
                         "model.shops_dwh.customer_orders": ["model.shops_dwh.order_metrics"],
                         "model.shops_dwh.order_metrics": [],
-                        "model.shops_dwh.core_invoices": [],
+                        "model.shops_dwh.core_invoices": ["model.shops_dwh.mart_invoice_rollup"],
                         "model.shops_dwh.core_campaign": [],
+                        "model.shops_dwh.mart_invoice_rollup": [],
                     },
                     "macros": {},
                 }
@@ -158,8 +166,8 @@ class DbtContextTests(unittest.TestCase):
         )
         return project_path
 
-    def test_diagnostic_context_is_upstream_only_and_relevance_gated(self):
-        """Check diagnostic context excludes downstream and keeps relevant parents."""
+    def test_diagnostic_context_keeps_one_relevant_upstream_model(self):
+        """Check diagnostic context keeps only nearest relevant parent."""
         with tempfile.TemporaryDirectory() as tmp:
             self._write_project(tmp)
 
@@ -167,11 +175,11 @@ class DbtContextTests(unittest.TestCase):
             text = "\n".join(result.values())
 
             self.assertIn('name="stg_customers"', text)
-            self.assertIn('name="raw_customers"', text)
+            self.assertNotIn('name="raw_customers"', text)
             self.assertNotIn("customer_orders", text)
 
-    def test_impact_context_contains_downstream_only(self):
-        """Check impact context is separated from diagnostic context."""
+    def test_impact_context_keeps_one_relevant_downstream_model(self):
+        """Check impact context keeps only nearest relevant child."""
         with tempfile.TemporaryDirectory() as tmp:
             self._write_project(tmp)
 
@@ -179,8 +187,8 @@ class DbtContextTests(unittest.TestCase):
 
             self.assertIn('name="customer_orders"', result)
             self.assertIn('depth="1"', result)
-            self.assertIn('name="order_metrics"', result)
-            self.assertIn('depth="2"', result)
+            self.assertNotIn('name="order_metrics"', result)
+            self.assertNotIn('depth="2"', result)
             self.assertNotIn('name="stg_customers"', result)
 
     def test_file_context_contains_primary_error_model_and_compiled_sql(self):
@@ -197,7 +205,7 @@ class DbtContextTests(unittest.TestCase):
             self.assertIn("<COMPILED_SQL path=", result)
             self.assertIn("<IMPACT_CONTEXT>", result)
             self.assertIn('name="customer_orders"', result)
-            self.assertIn('name="order_metrics"', result)
+            self.assertNotIn('name="order_metrics"', result)
 
     def test_syntax_error_keeps_primary_model_only(self):
         """Check local syntax errors do not pull lineage context."""
@@ -236,7 +244,10 @@ class DbtContextTests(unittest.TestCase):
             utils.get_context_log = lambda: (
                 "Failure in test relationships_core_invoices_campaign_id__campaign_id__ref_core_campaign_ "
                 "(models/core/_core_layer_doc.yml)\n"
-                "Got 360 results, configured to fail if != 0\n"
+                "Database Error in test relationships_core_invoices_campaign_id__campaign_id__ref_core_campaign_ "
+                "(models/core/_core_layer_doc.yml)\n"
+                "column \"campaign_id\" does not exist\n"
+                "LINE 15:     select campaign_id as from_field\n"
                 "compiled code at target/compiled/shops_dwh/models/core/_core_layer_doc.yml/"
                 "relationships_core_invoices.sql"
             )
@@ -245,12 +256,18 @@ class DbtContextTests(unittest.TestCase):
 
             self.assertIn('path="models/core/core_invoices.sql"', result)
             self.assertIn("<DBT_TEST_FAILURE>", result)
+            self.assertIn("<RELATIONSHIP_TEST_CONTEXT>", result)
+            self.assertIn("error_side: from_field", result)
+            self.assertIn("from_model: core_invoices", result)
+            self.assertIn("to_model: core_campaign", result)
             self.assertIn('RELATED_TEST_MODEL name="core_campaign"', result)
             self.assertIn("generate_surrogate_key", result)
             self.assertIn("campaign_reporting_key", result)
+            self.assertIn("NO_IMPACT_CONTEXT", result)
+            self.assertNotIn("mart_invoice_rollup", result)
 
-    def test_context_shrinks_only_for_ollama_provider(self):
-        """Check RAG shrinking is skipped for non-Ollama providers."""
+    def test_additional_context_shrinks_for_every_provider(self):
+        """Check additional context uses compact SQL context for every provider."""
         with tempfile.TemporaryDirectory() as tmp:
             self._write_project(tmp)
             context.structured_sql_context = lambda *args, **kwargs: "SHRUNK"
@@ -258,8 +275,7 @@ class DbtContextTests(unittest.TestCase):
             utils.config.ai_provider = "DeepSeek API"
             result = "\n".join(context.parse_lineage_models("models/mart/mart_customer_360.sql").values())
 
-            self.assertNotIn("SHRUNK", result)
-            self.assertIn("select cust_id from {{ ref('raw_customers') }}", result)
+            self.assertIn("SHRUNK", result)
 
             utils.config.ai_provider = "Ollama"
             result = "\n".join(context.parse_lineage_models("models/mart/mart_customer_360.sql").values())

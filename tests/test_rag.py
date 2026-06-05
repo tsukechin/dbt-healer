@@ -22,13 +22,11 @@ class RagTests(unittest.TestCase):
         result = structured_sql_context(
             source,
             {"cust_id"},
-            query='column "cust_id" is not unique',
             max_chars=800,
-            use_vector=False,
         )
 
-        self.assertIn("[RAG lexical retrieval", result)
-        self.assertIn("FINAL_SELECT", result)
+        self.assertIn("[RAG lexical windows", result)
+        self.assertIn("RELEVANT_WINDOWS", result)
         self.assertIn("cust_id", result)
         self.assertLessEqual(len(result), 850)
 

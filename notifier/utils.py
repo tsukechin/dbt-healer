@@ -1,5 +1,5 @@
-import asyncio
 import asyncpg
+from html import escape
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -43,3 +43,28 @@ async def notify_about_pr(files: str, request_url: str) -> None:
     finally:
         await bot.session.close()
     
+
+async def notify_about_review(finding: str) -> None:
+    """Notify subscribed chats about review findings."""
+    conn = await asyncpg.connect(
+        host='db',
+        database=config.dbt_project_name,
+        user=config.notifier_db_username,
+        password=config.notifier_db_password,
+        port=5432,
+    )
+    bot = Bot(token=config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    try:
+        async with conn.transaction():
+            async for id in conn.cursor("select tid from meta.ids"):
+                try:
+                    await bot.send_message(
+                        chat_id=id['tid'],
+                        text=f"Review finding:\n{escape(finding)}",
+                    )
+                except TelegramBadRequest as e:
+                    if 'chat not found' in str(e):
+                        print(f"Чат с id {id['tid']} не найден. Пропускаю...")
+    finally:
+        await bot.session.close()

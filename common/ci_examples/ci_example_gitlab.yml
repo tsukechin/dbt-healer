@@ -26,6 +26,9 @@ dbt_build:
       dbt deps
       cd "$CI_PROJECT_DIR"
 
+{healer_create_script}
+{healer_review_script}
+
       BEFORE="$CI_COMMIT_BEFORE_SHA"
       AFTER="$CI_COMMIT_SHA"
 
@@ -61,13 +64,4 @@ dbt_build:
         echo "changed models not found. get started full build..."
         dbt build --profile ci --target ci
       fi
-  after_script:
-    - |
-      if [[ "$CI_JOB_STATUS" == "failed" && "$CI_COMMIT_REF_NAME" == feature/* && -f "{dbt_project_name}/logs/dbt.log" ]]; then
-        curl -X 'POST' \
-          '{service_endpoint}' \
-          -F "repo={github_link}" \
-          -F "commit_hash=$CI_COMMIT_SHA" \
-          -F "dbt_path={dbt_project_name}" \
-          -F "log_file=@{dbt_project_name}/logs/dbt.log"
-      fi
+{healer_after_script}
