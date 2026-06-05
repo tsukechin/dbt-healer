@@ -15,7 +15,18 @@ from app.dbt_exps import (
 )
 
 config = get_config()
+status_logger = logging.getLogger("uvicorn.error")
 exp = DbtRegularExpressions()
+CI_FETCH_DEPTH = "50"
+
+
+def _status(message: str, run_id: str | None = None) -> None:
+    """Log a user-facing status line for CLI log streaming."""
+    if run_id:
+        status_logger.info("(%s) STATUS: %s", run_id, message)
+    else:
+        status_logger.info("STATUS: %s", message)
+
 
 def get_failed_repo_path() -> Path:
     """Return checked-out dbt project path."""
@@ -423,7 +434,7 @@ def has_dbt_dependencies(dbt_project_path: Path) -> bool:
     return any((dbt_project_path / name).exists() for name in ("packages.yml", "dependencies.yml"))
 
 
-def prepare_dbt_metadata(dbt_project_path: Path) -> None:
+def prepare_dbt_metadata(dbt_project_path: Path, run_id: str | None = None) -> None:
     """Refresh dbt dependencies and manifest metadata."""
     if has_dbt_dependencies(dbt_project_path):
         try:
@@ -437,8 +448,11 @@ def prepare_dbt_metadata(dbt_project_path: Path) -> None:
         logging.info("No dbt package config found; skipping dbt deps.")
 
     try:
+        _status("Running dbt parse", run_id)
         subprocess.run(["dbt", "--show-all-deprecations", "parse"], cwd=dbt_project_path, check=True)
+        _status("dbt parse completed", run_id)
     except subprocess.CalledProcessError as e:
+        _status("dbt parse failed", run_id)
         logging.warning(
             f"dbt parse failed; continuing without manifest lineage context. Error: {e}"
         )
@@ -466,6 +480,11 @@ def _ci_repo_root(repo: str, run_id: str | None = None) -> Path:
     return repo_dir
 
 
+def _is_empty_commit(commit_hash: str | None) -> bool:
+    """Return whether CI provided an empty all-zero commit placeholder."""
+    return not commit_hash or set(commit_hash.strip()) == {"0"}
+
+
 def clone_repo_from_ci(
     repo: str,
     commit_hash: str,
@@ -473,6 +492,7 @@ def clone_repo_from_ci(
     log_file: BinaryIO | None = None,
     run_id: str | None = None,
     branch_name: str | None = None,
+    diff_base: str | None = None,
 ) -> None:
     """Clone CI repository workspace and optionally store uploaded dbt log."""
     repo_dir = _ci_repo_root(repo, run_id)
@@ -480,19 +500,37 @@ def clone_repo_from_ci(
 
     if not (repo_dir / ".git").exists():
         repo_dir.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "clone", "--depth", "1", auth_repo, str(repo_dir)], check=True)
+        subprocess.run(["git", "clone", "--depth", CI_FETCH_DEPTH, auth_repo, str(repo_dir)], check=True)
 
     if branch_name:
         subprocess.run(
-            ["git", "fetch", "origin", f"refs/heads/{branch_name}:refs/remotes/origin/{branch_name}", "--depth", "1"],
+            [
+                "git",
+                "fetch",
+                "origin",
+                f"refs/heads/{branch_name}:refs/remotes/origin/{branch_name}",
+                "--depth",
+                CI_FETCH_DEPTH,
+            ],
             cwd=repo_dir,
             check=True,
         )
     else:
-        subprocess.run(["git", "fetch", "origin", commit_hash, "--depth", "1"], cwd=repo_dir, check=False)
+        subprocess.run(["git", "fetch", "origin", commit_hash, "--depth", CI_FETCH_DEPTH], cwd=repo_dir, check=False)
+
+    if not _is_empty_commit(diff_base):
+        subprocess.run(["git", "fetch", "origin", diff_base, "--depth", CI_FETCH_DEPTH], cwd=repo_dir, check=False)
+        (repo_dir / ".healer_diff_base").write_text(diff_base.strip(), encoding="utf-8")
 
     subprocess.run(
-        ["git", "fetch", "origin", f"{config.base_branch}:refs/remotes/origin/{config.base_branch}", "--depth", "1"],
+        [
+            "git",
+            "fetch",
+            "origin",
+            f"{config.base_branch}:refs/remotes/origin/{config.base_branch}",
+            "--depth",
+            CI_FETCH_DEPTH,
+        ],
         cwd=repo_dir,
         check=False,
     )
@@ -508,4 +546,4 @@ def clone_repo_from_ci(
     if not failed_repo_path.exists():
         raise RuntimeError(f"DBT project not found at {failed_repo_path}")
 
-    prepare_dbt_metadata(failed_repo_path)
+    prepare_dbt_metadata(failed_repo_path, run_id)

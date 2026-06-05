@@ -14,6 +14,20 @@ PATH = str(Path(__file__).resolve().parents[1])
 sys.path.append(PATH)
 
 app = FastAPI()
+status_logger = logging.getLogger("uvicorn.error")
+
+
+def _status(message: str, run_id: str | None = None) -> None:
+    """Log a user-facing status line for CLI log streaming."""
+    if run_id:
+        status_logger.info("(%s) STATUS: %s", run_id, message)
+    else:
+        status_logger.info("STATUS: %s", message)
+
+
+def _created_env_status(run_id: str) -> None:
+    """Log the isolated environment id once it is allocated."""
+    status_logger.info("STATUS: created env %s", run_id)
 
 
 def _new_run_id(repo: str, commit_hash: str, dbt_path: str) -> str:
@@ -22,10 +36,25 @@ def _new_run_id(repo: str, commit_hash: str, dbt_path: str) -> str:
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
 
 
+def _script_status_label(script: str) -> str:
+    """Return user-facing process label for an analyzer script."""
+    return {
+        "run.py": "Failure analysis process",
+        "review.py": "Review process",
+    }.get(script, f"{script} process")
+
+
 def _run_script(script: str, run_id: str) -> None:
     """Run an analyzer script with per-run environment."""
     env = {**os.environ, "HEALER_RUN_ID": run_id}
-    subprocess.run(["python3", script], cwd=PATH, env=env, check=True)
+    label = _script_status_label(script)
+    _status(f"{label} started", run_id)
+    try:
+        subprocess.run(["python3", script], cwd=PATH, env=env, check=True)
+    except subprocess.CalledProcessError:
+        _status(f"{label} failed", run_id)
+        raise
+    _status(f"{label} finished", run_id)
 
 
 def upload_failure(
@@ -35,14 +64,17 @@ def upload_failure(
     log_file: UploadFile,
     run_id: str,
     branch_name: str | None,
+    diff_base: str | None,
 ):
     """Process uploaded CI failure in background."""
     logging.info(
         "dbt failure received: repo=%s commit=%s path=%s run_id=%s branch=%s",
         repo, commit_hash, dbt_path, run_id, branch_name
     )
+    _status("Failure analysis started", run_id)
 
-    clone_repo_from_ci(repo, commit_hash, dbt_path, log_file, run_id, branch_name)
+    clone_repo_from_ci(repo, commit_hash, dbt_path, log_file, run_id, branch_name, diff_base)
+    _status("Failure payload prepared", run_id)
 
     _run_script("run.py", run_id)
 
@@ -60,10 +92,14 @@ def analyze(
     log_file: UploadFile = File(...),
     run_id: str | None = Form(None),
     branch_name: str | None = Form(None),
+    diff_base: str | None = Form(None),
 ):
     """Accept CI failure payload for async analysis."""
     try:
-        run_id = run_id or _new_run_id(repo, commit_hash, dbt_path)
+        if not run_id:
+            run_id = _new_run_id(repo, commit_hash, dbt_path)
+            _created_env_status(run_id)
+        _status("Failure accepted for analysis", run_id)
         background_tasks.add_task(
             upload_failure,
             repo,
@@ -72,6 +108,7 @@ def analyze(
             log_file,
             run_id,
             branch_name,
+            diff_base,
         )
         
         return {"status": "accepted", "run_id": run_id}
@@ -86,11 +123,15 @@ def create(
     commit_hash: str = Form(...),
     dbt_path: str = Form(...),
     branch_name: str | None = Form(None),
+    diff_base: str | None = Form(None),
 ):
     """Create isolated CI analysis workspace."""
     try:
         run_id = _new_run_id(repo, commit_hash, dbt_path)
-        clone_repo_from_ci(repo, commit_hash, dbt_path, run_id=run_id, branch_name=branch_name)
+        _created_env_status(run_id)
+        _status("Creating isolated check workspace and running dbt parse", run_id)
+        clone_repo_from_ci(repo, commit_hash, dbt_path, run_id=run_id, branch_name=branch_name, diff_base=diff_base)
+        _status("Analysis workspace created", run_id)
         return {"status": "created", "run_id": run_id}
     except Exception as e:
         logging.error(f"Error creating analysis instance: {e}")
@@ -104,6 +145,7 @@ def review(
 ):
     """Accept async review request for an existing analysis workspace."""
     try:
+        _status("Review accepted for analysis", run_id)
         background_tasks.add_task(_run_script, "review.py", run_id)
         return {"status": "accepted", "run_id": run_id}
     except Exception as e:

@@ -87,7 +87,8 @@ class AbstractCIGenerator(ABC):
               -F "repo={github_link}" \
               -F "commit_hash=${{ steps.get-hash.outputs.commit_hash }}" \
               -F "dbt_path={dbt_project_name}" \
-              -F "branch_name=${{ github.ref_name }}"
+              -F "branch_name=${{ github.ref_name }}" \
+              -F "diff_base=${{ github.event.before }}"
           )
           HEALER_RUN_ID=$(printf '%s' "$CREATE_RESPONSE" | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])')
           echo "run_id=$HEALER_RUN_ID" >> $GITHUB_OUTPUT"""
@@ -117,6 +118,7 @@ class AbstractCIGenerator(ABC):
           -F "dbt_path={dbt_project_name}" \
           -F "run_id=${{ steps.create-healer.outputs.run_id }}" \
           -F "branch_name=${{ github.ref_name }}" \
+          -F "diff_base=${{ github.event.before }}" \
           -F "log_file=@{dbt_project_name}/logs/dbt.log"
 """
 
@@ -138,7 +140,8 @@ class AbstractCIGenerator(ABC):
           -F "repo={github_link}" \
           -F "commit_hash=$CI_COMMIT_SHA" \
           -F "dbt_path={dbt_project_name}" \
-          -F "branch_name=$CI_COMMIT_REF_NAME"
+          -F "branch_name=$CI_COMMIT_REF_NAME" \
+          -F "diff_base=$CI_COMMIT_BEFORE_SHA"
       )
       HEALER_RUN_ID=$(printf '%s' "$CREATE_RESPONSE" | python -c 'import json, sys; print(json.load(sys.stdin)["run_id"])')
       echo "$HEALER_RUN_ID" > .healer_run_id"""
@@ -163,6 +166,7 @@ class AbstractCIGenerator(ABC):
           -F "dbt_path={dbt_project_name}" \
           -F "run_id=$HEALER_RUN_ID" \
           -F "branch_name=$CI_COMMIT_REF_NAME" \
+          -F "diff_base=$CI_COMMIT_BEFORE_SHA" \
           -F "log_file=@{dbt_project_name}/logs/dbt.log"
       fi"""
 

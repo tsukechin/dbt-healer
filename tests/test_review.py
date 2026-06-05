@@ -66,6 +66,72 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("-select 10 as amount", result)
         self.assertIn("+select 20 as amount", result)
 
+    def test_review_diff_uses_committed_head_not_worktree(self):
+        """Check generated files after checkout do not change review diff."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            project = repo_root / "shops_dwh"
+            project.mkdir()
+            model = project / "model.sql"
+
+            subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_root, check=True)
+            model.write_text("select 1 as id\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, capture_output=True)
+            model.write_text("select 2 as id\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "change"], cwd=repo_root, check=True, capture_output=True)
+            model.write_text("select 3 as id\n", encoding="utf-8")
+
+            utils.config = SimpleNamespace(
+                dbt_project_name="shops_dwh",
+                repo_root=repo_root,
+                base_branch="main",
+            )
+
+            result = review.build_review_context()
+
+        file_diff = result.split("<FILE_DIFF>\n", 1)[1].split("</FILE_DIFF>", 1)[0]
+        self.assertIn("+select 2 as id", file_diff)
+        self.assertNotIn("+select 3 as id", file_diff)
+
+    def test_review_prefers_ci_diff_base(self):
+        """Check review uses CI before SHA when base branch already points at HEAD."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            project = repo_root / "shops_dwh"
+            project.mkdir()
+            model = project / "model.sql"
+
+            subprocess.run(["git", "init", "--initial-branch=main"], cwd=repo_root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_root, check=True)
+            model.write_text("select 1 as id\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, capture_output=True)
+            before = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            model.write_text("select 2 as id\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "change"], cwd=repo_root, check=True, capture_output=True)
+            (repo_root / ".healer_diff_base").write_text(before, encoding="utf-8")
+
+            utils.config = SimpleNamespace(
+                dbt_project_name="shops_dwh",
+                repo_root=repo_root,
+                base_branch="main",
+            )
+
+            result = review.build_review_context()
+
+        self.assertIn("<CHANGED_FILES>\nM\tshops_dwh/model.sql", result)
+        self.assertIn("+select 2 as id", result)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,7 +199,10 @@ def setup():
 
 
 @app.command(help="Serve dbt-healer analyzer")
-def serve(port: int = 8888):
+def serve(
+    port: int = 8888,
+    logs: bool = typer.Option(False, "--logs", help="Stream Docker Compose logs after startup."),
+):
     """Start analyzer services with Docker Compose."""
     console.print(Markdown(f"Starting **dbt-healer** server on port {port}..."))
     config = get_config()
@@ -208,6 +211,12 @@ def serve(port: int = 8888):
     subprocess.run(["docker", "compose", "up", "-d"], check=True)
 
     console.print("[green]Server is running![/green]")
+    if logs:
+        console.print("[cyan]Streaming logs. Press Ctrl+C to stop.[/cyan]")
+        try:
+            subprocess.run(["docker", "compose", "logs", "-f"], check=False)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Log streaming stopped.[/yellow]")
 
 
 if __name__ == "__main__":
