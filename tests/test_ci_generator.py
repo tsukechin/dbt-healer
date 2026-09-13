@@ -1,4 +1,8 @@
 import tempfile
+import os
+import shutil
+import subprocess
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -21,6 +25,40 @@ def _config(tmp: str, **overrides) -> Config:
 
 
 class CIGeneratorTests(unittest.TestCase):
+    def test_github_full_build_runs_once_and_preserves_failure(self):
+        bash = shutil.which("bash")
+        if os.name == "nt":
+            bash = str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe")
+        if not bash or not Path(bash).exists():
+            self.skipTest("Bash is required to execute the CI build script")
+        with tempfile.TemporaryDirectory() as tmp:
+            generator = GithubCIGenerator(_config(tmp))
+            generator.create_ci_file()
+            content = (generator.ci_dir / generator.ci_file_name).read_text(encoding="utf-8")
+            script = textwrap.dedent(content.split("      - name: Build dbt project\n", 1)[1].split("        run: |\n", 1)[1].split("      - name:", 1)[0])
+            script = script.replace("${{ github.event.before }}", "abc123").replace("${{ github.sha }}", "def456")
+            for exit_code in (0, 7):
+                with self.subTest(exit_code=exit_code):
+                    stubs = (
+                        'export PATH="/usr/bin:$PATH"\n'
+                        "git() { echo shops_dwh/macros/money.sql; }\n"
+                        f"dbt() {{ echo BUILD_CALLED; return {exit_code}; }}\n"
+                    )
+                    result = subprocess.run([bash, "-c", stubs + script], cwd=tmp, capture_output=True, text=True)
+                    self.assertIn("starting full build", result.stdout, result.stderr)
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    self.assertEqual(result.stdout.count("BUILD_CALLED"), 1)
+
+    def test_gitlab_profile_uses_configured_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(tmp)
+            config.dbt_project_name = "analytics"
+            generator = GitlabCIGenerator(config)
+            generator.create_ci_file()
+            content = (generator.ci_dir / generator.ci_file_name).read_text(encoding="utf-8")
+        self.assertIn("analytics/profiles.yml", content)
+        self.assertNotIn("shops_dwh/profiles.yml", content)
+
     def test_github_ci_can_disable_review_and_failure_analysis(self):
         """Check setup flags remove all healer calls from GitHub CI."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -34,7 +34,7 @@ services:
     ports:
       - "${SERVICE_PORT}:${SERVICE_PORT}"
     healthcheck:
-      test: ["CMD-SHELL", "curl -GET localhost:${SERVICE_PORT}/health/"]
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ['SERVICE_PORT'] + '/health/', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -17,7 +17,7 @@ dbt_build:
   stage: build
   before_script:
     - pip install -r requirements.txt
-    - "sed -i '/^ci:/,$ s/host: localhost/host: postgres/' shops_dwh/profiles.yml"
+    - "sed -i '/^ci:/,$ s/host: localhost/host: postgres/' {dbt_project_name}/profiles.yml"
   script:
     - |
       set -euo pipefail
