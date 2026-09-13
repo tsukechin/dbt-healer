@@ -68,6 +68,7 @@ jobs:
             echo "macros, seeds or snapshots changes detected. starting full build..."
             cd {dbt_project_name}
             dbt build --profile ci --target ci
+            exit 0
           fi
 
           CHANGED_MODELS=$(
