@@ -50,7 +50,7 @@ def _run_script(script: str, run_id: str) -> None:
     label = _script_status_label(script)
     _status(f"{label} started", run_id)
     try:
-        subprocess.run(["python3", script], cwd=PATH, env=env, check=True)
+        subprocess.run([sys.executable, script], cwd=PATH, env=env, check=True)
     except subprocess.CalledProcessError:
         _status(f"{label} failed", run_id)
         raise
